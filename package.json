@@ -1,0 +1,24 @@
+{
+  "name": "coolify-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Coolify API integration",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "node test.js"
+  },
+  "keywords": ["mcp", "coolify", "deployment", "api"],
+  "author": "Claude Code",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "bin": {
+    "coolify-mcp": "./index.js"
+  }
+}
