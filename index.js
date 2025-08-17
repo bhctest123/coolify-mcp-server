@@ -3,22 +3,205 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
 
 class CoolifyMCPServer {
   constructor() {
-    this.baseUrl = process.env.COOLIFY_URL || `http://${process.env.PLATFORM_IP || "localhost"}:8000`;
+    // Security: Enforce HTTPS in production
+    this.baseUrl = this.validateAndSetBaseUrl();
     this.token = null;
     this.loadToken();
+    this.configureHttpsAgent();
+  }
+
+  validateAndSetBaseUrl() {
+    // Security: Default to HTTPS in production, allow HTTP override for development
+    let baseUrl;
+    if (process.env.COOLIFY_URL) {
+      baseUrl = process.env.COOLIFY_URL;
+    } else if (process.env.NODE_ENV === 'production') {
+      baseUrl = `https://${process.env.PLATFORM_IP || "localhost"}:8000`;
+    } else {
+      // Development: Allow HTTP for testing, but log security warning
+      baseUrl = `http://${process.env.PLATFORM_IP || "localhost"}:8000`;
+      console.warn('⚠️  WARNING: Using HTTP in development mode. HTTPS required for production.');
+    }
+    
+    // Security: Validate URL format
+    try {
+      const url = new URL(baseUrl);
+      if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:') {
+        throw new Error('HTTPS required in production environment');
+      }
+      return baseUrl;
+    } catch (error) {
+      console.error('Invalid Coolify URL configuration');
+      process.exit(1);
+    }
+  }
+
+  configureHttpsAgent() {
+    // Security: Configure HTTPS agent with proper security settings
+    this.httpsAgent = new https.Agent({
+      rejectUnauthorized: process.env.NODE_ENV === 'production',
+      secureProtocol: 'TLSv1_2_method',
+      ciphers: 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384'
+    });
   }
 
   loadToken() {
     try {
-      const tokenPath = process.env.COOLIFY_TOKEN_PATH || '/root/.coolify-token';
+      const tokenPath = this.validateTokenPath(process.env.COOLIFY_TOKEN_PATH || '/root/.coolify-token');
+      
+      // Security: Check file permissions
+      const stats = fs.statSync(tokenPath);
+      if (stats.mode & parseInt('077', 8)) {
+        throw new Error('Token file has unsafe permissions');
+      }
+      
       this.token = fs.readFileSync(tokenPath, 'utf8').trim();
+      
+      // Security: Validate token format
+      this.validateToken(this.token);
+      
     } catch (error) {
-      console.error('Failed to load Coolify token:', error.message);
+      // Security: Generic error message to prevent information disclosure
+      console.error('Authentication configuration error');
       process.exit(1);
     }
+  }
+
+  validateTokenPath(tokenPath) {
+    // Security: Prevent path traversal attacks
+    const resolvedPath = path.resolve(tokenPath);
+    const allowedPaths = [
+      '/root',
+      '/var/secrets',
+      '/opt/secrets',
+      process.env.HOME || '/root'
+    ];
+    
+    const isAllowed = allowedPaths.some(allowedPath => 
+      resolvedPath.startsWith(path.resolve(allowedPath))
+    );
+    
+    if (!isAllowed) {
+      throw new Error('Token path not in allowed directory');
+    }
+    
+    return resolvedPath;
+  }
+
+  validateToken(token) {
+    // Security: Validate token format (base64-like pattern)
+    if (!token || typeof token !== 'string') {
+      throw new Error('Invalid token format');
+    }
+    
+    // Check for reasonable token length (Coolify tokens are typically long)
+    if (token.length < 20 || token.length > 500) {
+      throw new Error('Invalid token length');
+    }
+    
+    // Check for dangerous characters that could indicate injection
+    if (/[<>"'&\r\n\t]/.test(token)) {
+      throw new Error('Token contains invalid characters');
+    }
+  }
+
+  // Security: UUID validation to prevent path injection
+  validateUUID(uuid) {
+    if (!uuid || typeof uuid !== 'string') {
+      throw new Error('UUID required');
+    }
+    
+    // Support both standard UUID v4 format and Coolify's custom format
+    const standardUuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const coolifyUuidRegex = /^[0-9a-z]{20,28}$/i; // Coolify's custom format (20-28 chars, alphanumeric)
+    
+    // Prevent obvious injection patterns
+    if (/[\/\\\.\.%]/.test(uuid)) {
+      throw new Error('Invalid UUID format - contains path characters');
+    }
+    
+    // Check against both supported formats
+    if (!standardUuidRegex.test(uuid) && !coolifyUuidRegex.test(uuid)) {
+      throw new Error('Invalid UUID format');
+    }
+    
+    return uuid;
+  }
+
+  // Security: Validate application log parameters
+  validateLogOptions(options) {
+    const validated = {};
+    
+    // Validate lines parameter
+    if (options.lines !== undefined) {
+      const lines = parseInt(options.lines, 10);
+      if (isNaN(lines) || lines < 1 || lines > 10000) {
+        throw new Error('Invalid lines parameter (1-10000)');
+      }
+      validated.lines = lines;
+    } else {
+      validated.lines = 100; // Safe default
+    }
+    
+    // Validate since parameter
+    if (options.since !== undefined) {
+      // Allow only safe time formats
+      if (!/^\d+[smhd]$/.test(options.since)) {
+        throw new Error('Invalid since parameter format (use 1s, 5m, 2h, 1d)');
+      }
+      validated.since = options.since;
+    } else {
+      validated.since = '1h'; // Safe default
+    }
+    
+    return validated;
+  }
+
+  // Security: Validate webhook payload
+  validateWebhookPayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Webhook payload must be an object');
+    }
+    
+    // Validate required fields
+    if (!payload.name || typeof payload.name !== 'string') {
+      throw new Error('Webhook name is required');
+    }
+    
+    if (!payload.url || typeof payload.url !== 'string') {
+      throw new Error('Webhook URL is required');
+    }
+    
+    // Validate URL format
+    try {
+      const url = new URL(payload.url);
+      if (!['http:', 'https:'].includes(url.protocol)) {
+        throw new Error('Webhook URL must use HTTP or HTTPS');
+      }
+    } catch (error) {
+      throw new Error('Invalid webhook URL format');
+    }
+    
+    // Sanitize name (alphanumeric and basic chars only)
+    if (!/^[a-zA-Z0-9\-_\s]{1,100}$/.test(payload.name)) {
+      throw new Error('Webhook name contains invalid characters');
+    }
+    
+    // Validate optional secret
+    if (payload.secret && typeof payload.secret !== 'string') {
+      throw new Error('Webhook secret must be a string');
+    }
+    
+    return {
+      name: payload.name.trim(),
+      url: payload.url,
+      secret: payload.secret || undefined
+    };
   }
 
   getHeaders() {
@@ -31,11 +214,23 @@ class CoolifyMCPServer {
 
   async makeRequest(method, endpoint, data = null) {
     try {
+      // Security: Validate endpoint to prevent injection
+      if (!endpoint || typeof endpoint !== 'string') {
+        throw new Error('Invalid endpoint');
+      }
+      
+      // Security: Prevent path traversal in endpoints
+      if (endpoint.includes('..') || endpoint.includes('//')) {
+        throw new Error('Invalid endpoint format');
+      }
+      
       const config = {
         method,
         url: `${this.baseUrl}/api/v1${endpoint}`,
         headers: this.getHeaders(),
-        timeout: 30000
+        timeout: 30000,
+        httpsAgent: this.httpsAgent,
+        maxRedirects: 0 // Security: Prevent redirect attacks
       };
 
       if (data) {
@@ -45,7 +240,27 @@ class CoolifyMCPServer {
       const response = await axios(config);
       return response.data;
     } catch (error) {
-      throw new Error(`Coolify API error: ${error.response?.data?.message || error.message}`);
+      // Security: Sanitized error messages to prevent information disclosure
+      if (error.response) {
+        const status = error.response.status;
+        if (status === 401) {
+          throw new Error('Authentication failed');
+        } else if (status === 403) {
+          throw new Error('Access denied');
+        } else if (status === 404) {
+          throw new Error('Resource not found');
+        } else if (status >= 500) {
+          throw new Error('Server error');
+        } else {
+          throw new Error('API request failed');
+        }
+      } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+        throw new Error('Service unavailable');
+      } else if (error.code === 'ETIMEDOUT') {
+        throw new Error('Request timeout');
+      } else {
+        throw new Error('Network error');
+      }
     }
   }
 
@@ -68,7 +283,9 @@ class CoolifyMCPServer {
 
   async getApplication(uuid) {
     try {
-      const data = await this.makeRequest('GET', `/applications/${uuid}`);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      const data = await this.makeRequest('GET', `/applications/${validatedUuid}`);
       return {
         success: true,
         application: data.data || data
@@ -83,12 +300,15 @@ class CoolifyMCPServer {
 
   async deployApplication(uuid, options = {}) {
     try {
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      
+      // Security: Validate and sanitize options
       const payload = {
-        force_rebuild: options.forceRebuild || false,
-        ...options
+        force_rebuild: Boolean(options.forceRebuild || false)
       };
       
-      const data = await this.makeRequest('POST', `/applications/${uuid}/deploy`, payload);
+      const data = await this.makeRequest('POST', `/applications/${validatedUuid}/deploy`, payload);
       return {
         success: true,
         deployment: data.data || data,
@@ -104,7 +324,9 @@ class CoolifyMCPServer {
 
   async getDeploymentStatus(uuid) {
     try {
-      const data = await this.makeRequest('GET', `/applications/${uuid}/status`);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      const data = await this.makeRequest('GET', `/applications/${validatedUuid}/status`);
       return {
         success: true,
         status: data.data || data
@@ -119,7 +341,9 @@ class CoolifyMCPServer {
 
   async listDeployments(uuid) {
     try {
-      const data = await this.makeRequest('GET', `/applications/${uuid}/deployments`);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      const data = await this.makeRequest('GET', `/applications/${validatedUuid}/deployments`);
       return {
         success: true,
         deployments: data.data || data
@@ -134,7 +358,9 @@ class CoolifyMCPServer {
 
   async stopApplication(uuid) {
     try {
-      const data = await this.makeRequest('POST', `/applications/${uuid}/stop`);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      const data = await this.makeRequest('POST', `/applications/${validatedUuid}/stop`);
       return {
         success: true,
         message: 'Application stopped successfully',
@@ -150,7 +376,9 @@ class CoolifyMCPServer {
 
   async restartApplication(uuid) {
     try {
-      const data = await this.makeRequest('POST', `/applications/${uuid}/restart`);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      const data = await this.makeRequest('POST', `/applications/${validatedUuid}/restart`);
       return {
         success: true,
         message: 'Application restarted successfully',
@@ -166,12 +394,18 @@ class CoolifyMCPServer {
 
   async getApplicationLogs(uuid, options = {}) {
     try {
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(uuid);
+      
+      // Security: Validate log options to prevent parameter injection
+      const validatedOptions = this.validateLogOptions(options);
+      
       const params = new URLSearchParams({
-        lines: options.lines || 100,
-        since: options.since || '1h'
+        lines: validatedOptions.lines,
+        since: validatedOptions.since
       });
       
-      const data = await this.makeRequest('GET', `/applications/${uuid}/logs?${params}`);
+      const data = await this.makeRequest('GET', `/applications/${validatedUuid}/logs?${params}`);
       return {
         success: true,
         logs: data.data || data
@@ -202,7 +436,13 @@ class CoolifyMCPServer {
 
   async createWebhook(applicationUuid, payload) {
     try {
-      const data = await this.makeRequest('POST', `/applications/${applicationUuid}/webhooks`, payload);
+      // Security: Validate UUID to prevent path injection
+      const validatedUuid = this.validateUUID(applicationUuid);
+      
+      // Security: Validate and sanitize webhook payload
+      const validatedPayload = this.validateWebhookPayload(payload);
+      
+      const data = await this.makeRequest('POST', `/applications/${validatedUuid}/webhooks`, validatedPayload);
       return {
         success: true,
         webhook: data.data || data,
